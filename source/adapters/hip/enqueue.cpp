@@ -8,6 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "enqueue.hpp"
 #include "common.hpp"
 #include "context.hpp"
 #include "event.hpp"
@@ -36,9 +37,11 @@ static size_t imageElementByteSize(hipArray_Format ArrayFormat) {
   return 0;
 }
 
-ur_result_t enqueueEventsWait(ur_queue_handle_t, hipStream_t Stream,
-                              uint32_t NumEventsInWaitList,
-                              const ur_event_handle_t *EventWaitList) {
+} // namespace
+
+UR_APIEXPORT ur_result_t UR_APICALL enqueueEventsWait(
+    ur_queue_handle_t, hipStream_t Stream, uint32_t NumEventsInWaitList,
+    const ur_event_handle_t *EventWaitList) {
   if (!EventWaitList) {
     return UR_RESULT_SUCCESS;
   }
@@ -66,10 +69,9 @@ ur_result_t enqueueEventsWait(ur_queue_handle_t, hipStream_t Stream,
   }
 }
 
-void simpleGuessLocalWorkSize(size_t *ThreadsPerBlock,
-                              const size_t *GlobalWorkSize,
-                              const size_t MaxThreadsPerBlock[3],
-                              ur_kernel_handle_t Kernel) {
+UR_APIEXPORT void UR_APICALL simpleGuessLocalWorkSize(
+    size_t *ThreadsPerBlock, const size_t *GlobalWorkSize,
+    const size_t MaxThreadsPerBlock[3], ur_kernel_handle_t Kernel) {
   assert(ThreadsPerBlock != nullptr);
   assert(GlobalWorkSize != nullptr);
   assert(Kernel != nullptr);
@@ -84,7 +86,6 @@ void simpleGuessLocalWorkSize(size_t *ThreadsPerBlock,
     --ThreadsPerBlock[0];
   }
 }
-} // namespace
 
 UR_APIEXPORT ur_result_t UR_APICALL urEnqueueMemBufferWrite(
     ur_queue_handle_t hQueue, ur_mem_handle_t hBuffer, bool blockingWrite,
@@ -256,59 +257,15 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueKernelLaunch(
   // Set the number of threads per block to the number of threads per warp
   // by default unless user has provided a better number
   size_t ThreadsPerBlock[3] = {32u, 1u, 1u};
-  size_t MaxWorkGroupSize = 0u;
+  size_t BlocksPerGrid[3] = {1u, 1u, 1u};
   size_t MaxThreadsPerBlock[3] = {};
   bool ProvidedLocalWorkGroupSize = (pLocalWorkSize != nullptr);
 
-  {
-    ur_result_t Result = urDeviceGetInfo(
-        hQueue->Device, UR_DEVICE_INFO_MAX_WORK_ITEM_SIZES,
-        sizeof(MaxThreadsPerBlock), MaxThreadsPerBlock, nullptr);
-    UR_ASSERT(Result == UR_RESULT_SUCCESS, Result);
-
-    Result =
-        urDeviceGetInfo(hQueue->Device, UR_DEVICE_INFO_MAX_WORK_GROUP_SIZE,
-                        sizeof(MaxWorkGroupSize), &MaxWorkGroupSize, nullptr);
-    UR_ASSERT(Result == UR_RESULT_SUCCESS, Result);
-
-    // The MaxWorkGroupSize = 1024 for AMD GPU
-    // The MaxThreadsPerBlock = {1024, 1024, 1024}
-
-    if (ProvidedLocalWorkGroupSize) {
-      auto isValid = [&](int dim) {
-        UR_ASSERT(pLocalWorkSize[dim] <= MaxThreadsPerBlock[dim],
-                  UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
-        // Checks that local work sizes are a divisor of the global work sizes
-        // which includes that the local work sizes are neither larger than the
-        // global work sizes and not 0.
-        UR_ASSERT(pLocalWorkSize != 0, UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
-        UR_ASSERT((pGlobalWorkSize[dim] % pLocalWorkSize[dim]) == 0,
-                  UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
-        ThreadsPerBlock[dim] = pLocalWorkSize[dim];
-        return UR_RESULT_SUCCESS;
-      };
-
-      for (size_t dim = 0; dim < workDim; dim++) {
-        auto err = isValid(dim);
-        if (err != UR_RESULT_SUCCESS)
-          return err;
-      }
-    } else {
-      simpleGuessLocalWorkSize(ThreadsPerBlock, pGlobalWorkSize,
-                               MaxThreadsPerBlock, hKernel);
-    }
-  }
-
-  UR_ASSERT(MaxWorkGroupSize >= size_t(ThreadsPerBlock[0] * ThreadsPerBlock[1] *
-                                       ThreadsPerBlock[2]),
-            UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
-
-  size_t BlocksPerGrid[3] = {1u, 1u, 1u};
-
-  for (size_t i = 0; i < workDim; i++) {
-    BlocksPerGrid[i] =
-        (pGlobalWorkSize[i] + ThreadsPerBlock[i] - 1) / ThreadsPerBlock[i];
-  }
+  hipFunction_t HIPFunc = hKernel->get();
+  UR_CHECK_ERROR(setKernelParams(hQueue->getContext(), hQueue->getDevice(),
+                                 workDim, pGlobalWorkOffset, pGlobalWorkSize,
+                                 pLocalWorkSize, hKernel, HIPFunc,
+                                 ThreadsPerBlock, BlocksPerGrid));
 
   ur_result_t Result = UR_RESULT_SUCCESS;
   std::unique_ptr<ur_event_handle_t_> RetImplEvent{nullptr};
@@ -321,7 +278,6 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueKernelLaunch(
     ur_stream_quard Guard;
     hipStream_t HIPStream = hQueue->getNextComputeStream(
         numEventsInWaitList, phEventWaitList, Guard, &StreamToken);
-    hipFunction_t HIPFunc = hKernel->get();
 
     if (DepEvents.size()) {
       UR_CHECK_ERROR(enqueueEventsWait(hQueue, HIPStream, DepEvents.size(),
@@ -333,22 +289,6 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueKernelLaunch(
       for (auto &MemArg : hKernel->Args.MemObjArgs) {
         migrateMemoryToDeviceIfNeeded(MemArg.Mem, hQueue->getDevice());
       }
-    }
-
-    // Set the implicit global offset parameter if kernel has offset variant
-    if (hKernel->getWithOffsetParameter()) {
-      std::uint32_t hip_implicit_offset[3] = {0, 0, 0};
-      if (pGlobalWorkOffset) {
-        for (size_t i = 0; i < workDim; i++) {
-          hip_implicit_offset[i] =
-              static_cast<std::uint32_t>(pGlobalWorkOffset[i]);
-          if (pGlobalWorkOffset[i] != 0) {
-            HIPFunc = hKernel->getWithOffsetParameter();
-          }
-        }
-      }
-      hKernel->setImplicitOffsetArg(sizeof(hip_implicit_offset),
-                                    hip_implicit_offset);
     }
 
     auto ArgIndices = hKernel->getArgIndices();
@@ -372,34 +312,6 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueKernelLaunch(
       }
       // We can release the MemoryMigrationMutexes now
       MemMigrationLocks.clear();
-    }
-
-    // Set local mem max size if env var is present
-    static const char *LocalMemSzPtrUR =
-        std::getenv("UR_HIP_MAX_LOCAL_MEM_SIZE");
-    static const char *LocalMemSzPtrPI =
-        std::getenv("SYCL_PI_HIP_MAX_LOCAL_MEM_SIZE");
-    static const char *LocalMemSzPtr =
-        LocalMemSzPtrUR ? LocalMemSzPtrUR
-                        : (LocalMemSzPtrPI ? LocalMemSzPtrPI : nullptr);
-
-    if (LocalMemSzPtr) {
-      int DeviceMaxLocalMem = 0;
-      UR_CHECK_ERROR(hipDeviceGetAttribute(
-          &DeviceMaxLocalMem, hipDeviceAttributeMaxSharedMemoryPerBlock,
-          Dev->get()));
-
-      static const int EnvVal = std::atoi(LocalMemSzPtr);
-      if (EnvVal <= 0 || EnvVal > DeviceMaxLocalMem) {
-        setErrorMessage(LocalMemSzPtrUR ? "Invalid value specified for "
-                                          "UR_HIP_MAX_LOCAL_MEM_SIZE"
-                                        : "Invalid value specified for "
-                                          "SYCL_PI_HIP_MAX_LOCAL_MEM_SIZE",
-                        UR_RESULT_ERROR_ADAPTER_SPECIFIC);
-        return UR_RESULT_ERROR_ADAPTER_SPECIFIC;
-      }
-      UR_CHECK_ERROR(hipFuncSetAttribute(
-          HIPFunc, hipFuncAttributeMaxDynamicSharedMemorySize, EnvVal));
     }
 
     UR_CHECK_ERROR(hipModuleLaunchKernel(
@@ -1566,4 +1478,174 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueWriteHostPipe(
     ur_queue_handle_t, ur_program_handle_t, const char *, bool, void *, size_t,
     uint32_t, const ur_event_handle_t *, ur_event_handle_t *) {
   return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+// Helper to compute kernel parameters from workload
+// dimensions.
+// @param [in]  Context handler to the target Context
+// @param [in]  Device handler to the target Device
+// @param [in]  WorkDim workload dimension
+// @param [in]  GlobalWorkOffset pointer workload global offsets
+// @param [in]  LocalWorkOffset pointer workload local offsets
+// @param [inout] Kernel handler to the kernel
+// @param [inout] HIPFunc handler to the HIP function attached to the kernel
+// @param [out] ThreadsPerBlock Number of threads per block we should run
+// @param [out] BlocksPerGrid Number of blocks per grid we should run
+ur_result_t
+setKernelParams(const ur_context_handle_t Context,
+                const ur_device_handle_t Device, const uint32_t WorkDim,
+                const size_t *GlobalWorkOffset, const size_t *GlobalWorkSize,
+                const size_t *LocalWorkSize, ur_kernel_handle_t &Kernel,
+                hipFunction_t &HIPFunc, size_t (&ThreadsPerBlock)[3],
+                size_t (&BlocksPerGrid)[3]) {
+  ur_result_t Result = UR_RESULT_SUCCESS;
+  size_t MaxThreadsPerBlock[3] = {};
+  size_t MaxWorkGroupSize = 0u;
+  bool ProvidedLocalWorkGroupSize = LocalWorkSize != nullptr;
+  uint32_t LocalSize = Kernel->getLocalSize();
+
+  try {
+    // Set the active context here as guessLocalWorkSize needs an active context
+    ScopedContext Active(Device);
+    {
+      ur_result_t Result = urDeviceGetInfo(
+          Device, UR_DEVICE_INFO_MAX_WORK_ITEM_SIZES,
+          sizeof(MaxThreadsPerBlock), MaxThreadsPerBlock, nullptr);
+      UR_ASSERT(Result == UR_RESULT_SUCCESS, Result);
+
+      Result =
+          urDeviceGetInfo(Device, UR_DEVICE_INFO_MAX_WORK_GROUP_SIZE,
+                          sizeof(MaxWorkGroupSize), &MaxWorkGroupSize, nullptr);
+      UR_ASSERT(Result == UR_RESULT_SUCCESS, Result);
+      // The MaxWorkGroupSize = 1024 for AMD GPU
+      // The MaxThreadsPerBlock = {1024, 1024, 1024}
+
+      if (ProvidedLocalWorkGroupSize) {
+        auto isValid = [&](int dim) {
+          UR_ASSERT(LocalWorkSize[dim] <= MaxThreadsPerBlock[dim],
+                    UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
+          // Checks that local work sizes are a divisor of the global work sizes
+          // which includes that the local work sizes are neither larger than
+          // the global work sizes and not 0.
+          UR_ASSERT(LocalWorkSize != 0,
+                    UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
+          UR_ASSERT((GlobalWorkSize[dim] % LocalWorkSize[dim]) == 0,
+                    UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
+          ThreadsPerBlock[dim] = LocalWorkSize[dim];
+          return UR_RESULT_SUCCESS;
+        };
+
+        for (size_t dim = 0; dim < WorkDim; dim++) {
+          auto err = isValid(dim);
+          if (err != UR_RESULT_SUCCESS)
+            return err;
+        }
+      } else {
+        simpleGuessLocalWorkSize(ThreadsPerBlock, GlobalWorkSize,
+                                 MaxThreadsPerBlock, Kernel);
+      }
+    }
+
+    UR_ASSERT(MaxWorkGroupSize >=
+                  size_t(ThreadsPerBlock[0] * ThreadsPerBlock[1] *
+                         ThreadsPerBlock[2]),
+              UR_RESULT_ERROR_INVALID_WORK_GROUP_SIZE);
+
+    for (size_t i = 0; i < WorkDim; i++) {
+      BlocksPerGrid[i] =
+          (GlobalWorkSize[i] + ThreadsPerBlock[i] - 1) / ThreadsPerBlock[i];
+    }
+
+    // Set the implicit global offset parameter if kernel has offset variant
+    if (Kernel->getWithOffsetParameter()) {
+      std::uint32_t ImplicitOffset[3] = {0, 0, 0};
+      if (GlobalWorkOffset) {
+        for (size_t i = 0; i < WorkDim; i++) {
+          ImplicitOffset[i] = static_cast<std::uint32_t>(GlobalWorkOffset[i]);
+          if (GlobalWorkOffset[i] != 0) {
+            HIPFunc = Kernel->getWithOffsetParameter();
+          }
+        }
+      }
+      Kernel->setImplicitOffsetArg(sizeof(ImplicitOffset), ImplicitOffset);
+    }
+
+    // Set local mem max size if env var is present
+    static const char *LocalMemSzPtrUR =
+        std::getenv("UR_HIP_MAX_LOCAL_MEM_SIZE");
+    static const char *LocalMemSzPtrPI =
+        std::getenv("SYCL_PI_HIP_MAX_LOCAL_MEM_SIZE");
+    static const char *LocalMemSzPtr =
+        LocalMemSzPtrUR ? LocalMemSzPtrUR
+                        : (LocalMemSzPtrPI ? LocalMemSzPtrPI : nullptr);
+
+    if (LocalMemSzPtr) {
+      int DeviceMaxLocalMem = 0;
+      UR_CHECK_ERROR(hipDeviceGetAttribute(
+          &DeviceMaxLocalMem, hipDeviceAttributeMaxSharedMemoryPerBlock,
+          Device->get()));
+
+      static const int EnvVal = std::atoi(LocalMemSzPtr);
+      if (EnvVal <= 0 || EnvVal > DeviceMaxLocalMem) {
+        setErrorMessage(LocalMemSzPtrUR ? "Invalid value specified for "
+                                          "UR_HIP_MAX_LOCAL_MEM_SIZE"
+                                        : "Invalid value specified for "
+                                          "SYCL_PI_HIP_MAX_LOCAL_MEM_SIZE",
+                        UR_RESULT_ERROR_ADAPTER_SPECIFIC);
+        return UR_RESULT_ERROR_ADAPTER_SPECIFIC;
+      }
+      UR_CHECK_ERROR(hipFuncSetAttribute(
+          HIPFunc, hipFuncAttributeMaxDynamicSharedMemorySize, EnvVal));
+    }
+  } catch (ur_result_t Err) {
+    Result = Err;
+  }
+  return Result;
+}
+
+void setCopyRectParams(ur_rect_region_t region, const void *SrcPtr,
+                       const hipMemoryType SrcType, ur_rect_offset_t src_offset,
+                       size_t src_row_pitch, size_t src_slice_pitch,
+                       void *DstPtr, const hipMemoryType DstType,
+                       ur_rect_offset_t dst_offset, size_t dst_row_pitch,
+                       size_t dst_slice_pitch, hipMemcpy3DParms &Params) {
+  // Set all params to 0 first
+  std::memset(&Params, 0, sizeof(hipMemcpy3DParms));
+  src_row_pitch =
+      (!src_row_pitch) ? region.width + src_offset.x : src_row_pitch;
+  src_slice_pitch = (!src_slice_pitch)
+                        ? ((region.height + src_offset.y) * src_row_pitch)
+                        : src_slice_pitch;
+  dst_row_pitch =
+      (!dst_row_pitch) ? region.width + dst_offset.x : dst_row_pitch;
+  dst_slice_pitch = (!dst_slice_pitch)
+                        ? ((region.height + dst_offset.y) * dst_row_pitch)
+                        : dst_slice_pitch;
+
+  Params.extent.depth = region.depth;
+  Params.extent.height = region.height;
+  Params.extent.width = region.depth;
+
+  // TODO: This is bullshit
+  Params.srcPtr.ptr = const_cast<void *>(SrcPtr);
+  Params.srcPtr.pitch = src_row_pitch;
+  Params.srcPtr.xsize = src_row_pitch;
+  Params.srcPtr.ysize = src_slice_pitch / src_row_pitch;
+  Params.srcPos.x = src_offset.x;
+  Params.srcPos.y = src_offset.y;
+  Params.srcPos.z = src_offset.z;
+
+  Params.dstPtr.ptr = const_cast<void *>(DstPtr);
+  Params.dstPtr.pitch = dst_row_pitch;
+  Params.dstPtr.xsize = dst_row_pitch;
+  Params.dstPtr.ysize = dst_slice_pitch / dst_row_pitch;
+  Params.dstPos.x = dst_offset.x;
+  Params.dstPos.y = dst_offset.y;
+  Params.dstPos.z = dst_offset.z;
+
+  Params.kind = (SrcType == hipMemoryTypeDevice
+                     ? (DstType == hipMemoryTypeDevice ? hipMemcpyDeviceToDevice
+                                                       : hipMemcpyDeviceToHost)
+                     : (DstType == hipMemoryTypeDevice ? hipMemcpyHostToDevice
+                                                       : hipMemcpyHostToHost));
 }
